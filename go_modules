@@ -27,6 +27,7 @@ vendor/ directory populated by go mod vendor.
 See README.md for additional documentation.
 """
 
+import difflib
 import logging
 import argparse
 import re
@@ -34,6 +35,7 @@ import libarchive
 import os
 import sys
 import tempfile
+import yaml
 
 from pathlib import Path
 from subprocess import run
@@ -44,6 +46,7 @@ description = __doc__
 
 DEFAULT_COMPRESSION = "gz"
 DEFAULT_VENDOR_STEM = "vendor"
+DEFAULT_MOD_DIFF = "go-modules.patch"
 
 
 def get_archive_parameters(args):
@@ -209,6 +212,7 @@ def sanitize_subdir(basedir, subdir):
 
 
 def main():
+    mod_updates = {}
     log.info(f"Running OBS Source Service: {app_name}")
 
     parser = argparse.ArgumentParser(
@@ -221,6 +225,8 @@ def main():
     parser.add_argument("--basename")
     parser.add_argument("--vendorname", default=DEFAULT_VENDOR_STEM)
     parser.add_argument("--subdir")
+    parser.add_argument("--modupdates")
+    parser.add_argument("--moddiff", default=DEFAULT_MOD_DIFF)
     args = parser.parse_args()
 
     outdir = args.outdir
@@ -238,6 +244,18 @@ def main():
         archive = archive_autodetect()
     log.info(f"Using archive {archive}")
 
+    if args.modupdates:
+        modupdatepath = sanitize_subdir(
+            os.getcwd(), os.path.join(os.getcwd(), args.modupdates)
+        )
+        if os.path.exists(modupdatepath):
+            with open(modupdatepath, 'r') as f:
+                mod_updates = yaml.safe_load(f)
+
+        moddiff = sanitize_subdir(
+            outdir, os.path.join(outdir, args.moddiff)
+        )
+
     with tempfile.TemporaryDirectory() as tempdir:
         extract(archive, tempdir)
 
@@ -247,12 +265,11 @@ def main():
             or basename_from_archive_name(archive)
         )
         if subdir:
-            go_mod_path = sanitize_subdir(
-                tempdir, os.path.join(tempdir, basename, subdir, "go.mod")
-            )
+            basedir = os.path.join(basename, subdir)
         else:
-            go_mod_path = sanitize_subdir(
-                tempdir, os.path.join(tempdir, basename, "go.mod")
+            basedir = basename
+        go_mod_path = sanitize_subdir(
+            tempdir, os.path.join(tempdir, basedir, "go.mod")
             )
         if go_mod_path and os.path.exists(go_mod_path):
             go_mod_dir = os.path.dirname(go_mod_path)
@@ -260,6 +277,33 @@ def main():
         else:
             log.error(f"File go.mod not found under {os.path.join(tempdir, basename)}")
             exit(1)
+
+        if mod_updates and 'go_module' in mod_updates and 'module_updates' in mod_updates['go_module']:
+            flines = {}
+            for file in ["go.mod", "go.sum"]:
+                with open(os.path.join(go_mod_dir, file), 'r') as f:
+                    flines[file] = f.readlines()
+            for modupdate in mod_updates['go_module']['module_updates']:
+                log.info(f"Processing: `go get \"{modupdate}\"`")
+                if re.fullmatch('[a-zA-E0-9\~\-_.:/]+(@[a-zA-E0-9\~\-_.:/]+){0,1}', modupdate) is None:
+                    log.error(f"{modupdate} contains invalid characters")
+                    exit(1)
+                if sys.version_info >= (3, 7):
+                  cp = run(["go", "get", f"{modupdate}" ], cwd=go_mod_dir, capture_output=True, text=True)
+                else:
+                  cp = run(["go", "get", f"{modupdate}" ], cwd=go_mod_dir)
+            if cp.returncode:
+                if not cp.stderr is None:
+                    log.error(cp.stderr.strip())
+                exit(1)
+            with open(moddiff, 'w') as diff_f:
+                for file in ["go.mod", "go.sum"]:
+                    with open(os.path.join(go_mod_dir, file), 'r') as f:
+                        tlines = f.readlines()
+                        diff = difflib.unified_diff(flines[file],tlines,
+                                                    os.path.join('a', basedir, file),
+                                                    os.path.join('b', basedir, file))
+                        diff_f.writelines(diff)
 
         if args.strategy == "vendor":
             # go subcommand sequence:
